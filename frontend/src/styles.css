@@ -1,0 +1,149 @@
+:root { color-scheme: light; }
+html { min-width: 320px; }
+
+
+/* Employee edit modal overlay */
+.ws-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  overflow-y: auto;
+  background: rgba(15, 23, 42, 0.58);
+  backdrop-filter: blur(5px);
+}
+
+.ws-modal {
+  width: 100%;
+  max-width: 620px;
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+  box-sizing: border-box;
+  padding: 28px;
+  border: 1px solid #e2e8f0;
+  border-radius: 18px;
+  background: #fff;
+  color: #1e293b;
+  box-shadow: 0 25px 80px rgba(15, 23, 42, 0.24);
+  animation: ws-modal-appear 180ms ease-out;
+}
+
+.ws-modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 26px;
+}
+
+.ws-modal-header h2 {
+  margin: 8px 0;
+  font-size: 25px;
+  font-weight: 700;
+}
+
+.ws-modal-header p {
+  margin: 0;
+  color: #64748b;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.ws-modal-close {
+  display: grid;
+  flex-shrink: 0;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border: 0;
+  border-radius: 10px;
+  background: #f1f5f9;
+  color: #334155;
+  cursor: pointer;
+}
+
+.ws-modal-close:hover {
+  background: #e2e8f0;
+}
+
+.ws-modal-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.ws-modal-form > * {
+  min-width: 0;
+}
+
+.ws-modal-form input,
+.ws-modal-form select {
+  box-sizing: border-box;
+  width: 100%;
+}
+
+.ws-modal-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 8px;
+  padding-top: 20px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.ws-modal-actions button:disabled,
+.ws-modal-close:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.ws-modal-error {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid #fecaca;
+  border-radius: 9px;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 14px;
+}
+
+@keyframes ws-modal-appear {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (max-width: 560px) {
+  .ws-modal-overlay {
+    padding: 12px;
+  }
+
+  .ws-modal {
+    max-height: calc(100vh - 24px);
+    padding: 20px;
+    border-radius: 14px;
+  }
+
+  .ws-modal-form {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+
+  .ws-modal-header h2 {
+    font-size: 22px;
+  }
+}

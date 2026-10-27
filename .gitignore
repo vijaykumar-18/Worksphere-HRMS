@@ -1,0 +1,17 @@
+# Python
+.venv/
+**/.venv/
+__pycache__/
+*.pyc
+
+# Environment secrets
+.env
+**/.env
+
+# Frontend dependencies
+node_modules/
+**/node_modules/
+frontend/dist/
+
+# Local databases
+*.db
