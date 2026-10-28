@@ -1,12 +1,23 @@
 from datetime import date, datetime, time, timedelta, timezone
+import base64
+from email.message import EmailMessage
+import hashlib
+import html
+import json
+import logging
+import smtplib
 from pathlib import Path
 from uuid import uuid4
 import csv
 import io
 import calendar
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, quote, urlsplit
+from urllib.request import Request, urlopen
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form, status
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import or_, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -14,22 +25,141 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.dependencies import get_current_user, get_employee_for_user, require_roles
-from app.models import (Attendance, Document, Employee, EmployeeShift, Leave, LeaveBalance, LeavePolicy,
-                        Notification, Payroll, PerformanceReview, Shift, User, utc_now)
+from app.models import (Announcement, Attendance, Document, Employee, EmployeeShift, Feedback,
+                        GoogleCalendarConnection, GoogleCalendarEvent, GoogleOAuthState, InternalTask,
+                        Leave, LeaveBalance, LeavePolicy, Notification, OnboardingTask, Payroll,
+                        PerformanceReview, Resignation, Shift, User, UserSettings, utc_now)
 from app.schemas import (AttendanceOut, EmployeeOut, EmployeeUpdate, LeaveCreate, LeaveDecision, LeaveOut,
                          LeavePolicyInput, LeaveBalanceInput, PayrollCreate, PayrollOut, LoginRequest,
                          NotificationOut, PerformanceInput, ShiftInput, ShiftAssignmentInput, UserCreate,
-                         UserOut, UserRegister, UserUpdate)
+                         UserOut, UserRegister, UserUpdate, AnnouncementCreate, FeedbackCreate,
+                         InternalTaskCreate, InternalTaskUpdate, OnboardingTaskCreate, OnboardingTaskUpdate,
+                         PasswordChange, ProfileUpdate, ResignationCreate, ResignationDecision,
+                         UserSettingsUpdate)
 from app.security import create_access_token, hash_password, verify_password
 
 api = APIRouter()
+logger = logging.getLogger(__name__)
 UPLOAD_DIR = Path(__file__).resolve().parents[1] / "uploads"
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".doc", ".docx", ".txt"}
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_CALENDAR_API = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 
 
-def notify(db: Session, user_id: int, title: str, message: str) -> None:
+def send_email(recipient: str, subject: str, message: str) -> None:
+    if not settings.smtp_host or not settings.email_from:
+        raise HTTPException(503, "Email is not configured. Set SMTP_HOST and EMAIL_FROM in backend .env.")
+    email = EmailMessage()
+    email["Subject"] = subject
+    email["From"] = settings.email_from
+    email["To"] = recipient
+    email.set_content(message)
+    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as smtp:
+        smtp.starttls()
+        if settings.smtp_username and settings.smtp_password:
+            smtp.login(settings.smtp_username, settings.smtp_password)
+        smtp.send_message(email)
+
+
+def _google_configured() -> bool:
+    return bool(settings.google_oauth_client_id and settings.google_oauth_client_secret)
+
+
+def _google_token_cipher() -> Fernet:
+    key_material = hashlib.sha256(
+        f"worksphere-google-refresh-token:{settings.secret_key}".encode("utf-8")
+    ).digest()
+    return Fernet(base64.urlsafe_b64encode(key_material))
+
+
+def _google_json_request(url: str, method: str = "GET", token: str | None = None,
+                         payload: dict | None = None) -> dict:
+    headers = {"Accept": "application/json"}
+    body = None
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        body = json.dumps(payload).encode("utf-8")
+    request = Request(url, data=body, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=20) as response:
+            content = response.read()
+            return json.loads(content) if content else {}
+    except HTTPError as exc:
+        if exc.code == 404:
+            return {"_http_status": 404}
+        if exc.code == 401:
+            raise HTTPException(400, "Google authorization expired or was revoked. Reconnect your calendar.") from exc
+        logger.warning("Google API request failed with status %s", exc.code)
+        raise HTTPException(502, "Google Calendar request failed. Check the connection and try again.") from exc
+    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        logger.warning("Google API request could not be completed: %s", type(exc).__name__)
+        raise HTTPException(502, "Could not reach Google Calendar. Try again later.") from exc
+
+
+def _google_access_token(connection: GoogleCalendarConnection) -> str:
+    try:
+        refresh_token = _google_token_cipher().decrypt(
+            connection.encrypted_refresh_token.encode("ascii")
+        ).decode("utf-8")
+    except (InvalidToken, UnicodeDecodeError) as exc:
+        logger.exception("Stored Google refresh token could not be decrypted for user_id=%s", connection.user_id)
+        raise HTTPException(500, "Stored Google Calendar credentials cannot be read. Disconnect and reconnect the account.") from exc
+    try:
+        request = Request(
+            GOOGLE_TOKEN_URL,
+            data=urlencode({
+                "client_id": settings.google_oauth_client_id or "",
+                "client_secret": settings.google_oauth_client_secret or "",
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urlopen(request, timeout=20) as response:
+            result = json.loads(response.read())
+    except HTTPError as exc:
+        if exc.code in (400, 401):
+            raise HTTPException(400, "Google authorization expired or was revoked. Reconnect your calendar.") from exc
+        logger.warning("Google token refresh failed with status %s", exc.code)
+        raise HTTPException(502, "Google token refresh failed. Try again later.") from exc
+    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        logger.warning("Google token refresh could not be completed: %s", type(exc).__name__)
+        raise HTTPException(502, "Could not reach Google authentication. Try again later.") from exc
+    if not isinstance(result, dict):
+        raise HTTPException(502, "Google returned an invalid token refresh response.")
+    access_token = result.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        raise HTTPException(502, "Google returned an invalid access token response.")
+    return access_token
+
+
+def google_oauth_result_page(result: str, message: str) -> HTMLResponse:
+    target_origin = json.dumps(settings.frontend_origin.rstrip("/"))
+    result_json = json.dumps(result)
+    message_json = json.dumps(message)
+    page = f"""<!doctype html><html lang="en"><meta charset="utf-8"><title>Google Calendar</title>
+<body><p>{html.escape(message)}</p>
+<script>if(window.opener){{window.opener.postMessage({{type:"worksphere-google-calendar",status:{result_json},message:{message_json}}},{target_origin});window.close();}}</script></body></html>"""
+    return HTMLResponse(page)
+
+
+def notify(db: Session, user_id: int, title: str, message: str, email_preference: str | None = None) -> None:
     db.add(Notification(user_id=user_id, title=title, message=message))
+    account = db.get(User, user_id)
+    preferences = db.query(UserSettings).filter_by(user_id=user_id).first()
+    preference_enabled = preferences and (getattr(preferences, email_preference) if email_preference else True)
+    if (account and account.is_active and account.email and settings.smtp_host and settings.email_from
+            and preferences and preferences.email_notifications and preference_enabled):
+        try:
+            send_email(account.email, title, message)
+        except (HTTPException, OSError, smtplib.SMTPException):
+            logger.exception("Could not send notification email to user_id=%s", user_id)
 
 
 def employee_output(employee: Employee) -> dict:
@@ -184,6 +314,10 @@ def delete_user(user_id: int, actor: User = Depends(require_roles("ADMIN")), db:
             db.query(EmployeeShift).filter_by(employee_id=employee.id).first(),
             db.query(Document).filter_by(employee_id=employee.id).first(),
             db.query(PerformanceReview).filter_by(employee_id=employee.id).first(),
+            db.query(OnboardingTask).filter_by(employee_id=employee.id).first(),
+            db.query(Resignation).filter_by(employee_id=employee.id).first(),
+            db.query(InternalTask).filter_by(assigned_to=employee.id).first(),
+            db.query(Feedback).filter_by(employee_id=employee.id).first(),
         ])
         if has_history:
             raise HTTPException(409, "This user has HR history. Deactivate the account instead of permanently deleting it.")
@@ -191,9 +325,14 @@ def delete_user(user_id: int, actor: User = Depends(require_roles("ADMIN")), db:
         db.query(Leave).filter_by(reviewed_by=user_id).first(),
         db.query(Document).filter_by(uploaded_by=user_id).first(),
         db.query(PerformanceReview).filter_by(reviewer_id=user_id).first(),
+        db.query(Announcement).filter_by(created_by=user_id).first(),
+        db.query(InternalTask).filter_by(assigned_by=user_id).first(),
+        db.query(Resignation).filter_by(reviewed_by=user_id).first(),
+        db.query(GoogleCalendarConnection).filter_by(user_id=user_id).first(),
     ])
     if referenced: raise HTTPException(409, "This user is referenced by HR records. Deactivate the account instead.")
     db.query(Notification).filter_by(user_id=user_id).delete()
+    db.query(UserSettings).filter_by(user_id=user_id).delete()
     if employee:
         db.query(LeaveBalance).filter_by(employee_id=employee.id).delete()
         db.delete(employee)
@@ -218,6 +357,19 @@ def list_employees(q: str | None = Query(None, max_length=120), department: str 
 @api.get("/employees/me", response_model=EmployeeOut)
 def my_profile(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     employee = get_employee_for_user(user, db)
+    return employee_output(employee)
+
+
+@api.patch("/employees/me")
+def update_my_profile(payload: ProfileUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    employee = get_employee_for_user(user, db)
+    existing = db.query(User).filter(User.email == payload.email, User.id != user.id).first()
+    if existing:
+        raise HTTPException(409, "Email address is already in use")
+    employee.full_name = payload.full_name.strip()
+    user.email = payload.email
+    db.commit()
+    db.refresh(employee)
     return employee_output(employee)
 
 
@@ -671,3 +823,509 @@ def advanced_employee_search(q: str | None = None, department: str | None = None
         results.append({**employee_output(employee), "latest_rating": latest.rating if latest else None,
                         "today_attendance": today_status})
     return results
+
+
+# ONBOARDING
+def onboarding_output(db: Session, item: OnboardingTask) -> dict:
+    employee = db.get(Employee, item.employee_id)
+    return {"id": item.id, "employee_id": item.employee_id,
+            "employee_name": employee.full_name if employee else "Unknown",
+            "task_name": item.task_name, "status": item.status, "due_date": item.due_date}
+
+
+@api.get("/onboarding")
+def list_onboarding(employee_id: int | None = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    query = db.query(OnboardingTask)
+    if user.role not in ("HR", "ADMIN"):
+        query = query.filter(OnboardingTask.employee_id == get_employee_for_user(user, db).id)
+    elif employee_id:
+        query = query.filter(OnboardingTask.employee_id == employee_id)
+    return [onboarding_output(db, item) for item in query.order_by(OnboardingTask.due_date, OnboardingTask.id).limit(1000).all()]
+
+
+@api.post("/onboarding", status_code=201)
+def create_onboarding_task(payload: OnboardingTaskCreate, user: User = Depends(require_roles("HR", "ADMIN")), db: Session = Depends(get_db)):
+    employee = get_employee(db, payload.employee_id)
+    item = OnboardingTask(**payload.model_dump())
+    db.add(item)
+    db.flush()
+    notify(db, employee.user_id, "New onboarding task assigned",
+           f"{item.task_name} is due {item.due_date}.", "task_reminders")
+    db.commit()
+    db.refresh(item)
+    return onboarding_output(db, item)
+
+
+@api.patch("/onboarding/{task_id}")
+def update_onboarding_task(task_id: int, payload: OnboardingTaskUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    item = db.get(OnboardingTask, task_id)
+    if not item:
+        raise HTTPException(404, "Onboarding task not found")
+    if user.role not in ("HR", "ADMIN") and item.employee_id != get_employee_for_user(user, db).id:
+        raise HTTPException(403, "You can only update your own onboarding checklist")
+    item.status = payload.status
+    db.commit()
+    db.refresh(item)
+    return onboarding_output(db, item)
+
+
+# RESIGNATIONS
+def resignation_output(db: Session, item: Resignation) -> dict:
+    employee = db.get(Employee, item.employee_id)
+    return {"id": item.id, "employee_id": item.employee_id,
+            "employee_name": employee.full_name if employee else "Unknown",
+            "reason": item.reason, "notice_period": item.notice_period, "status": item.status,
+            "created_at": item.created_at, "reviewed_by": item.reviewed_by}
+
+
+@api.post("/resignations", status_code=201)
+def create_resignation(payload: ResignationCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    employee = get_employee_for_user(user, db)
+    pending = db.query(Resignation).filter_by(employee_id=employee.id, status="PENDING").first()
+    if pending:
+        raise HTTPException(409, "You already have a pending resignation")
+    item = Resignation(employee_id=employee.id, **payload.model_dump())
+    db.add(item)
+    db.flush()
+    for recipient in db.query(User).filter(User.role.in_(["HR", "ADMIN"]), User.is_active.is_(True)).all():
+        notify(db, recipient.id, "New resignation submitted", f"{employee.full_name} submitted a resignation request.")
+    db.commit()
+    db.refresh(item)
+    return resignation_output(db, item)
+
+
+@api.get("/resignations")
+def list_resignations(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    query = db.query(Resignation)
+    if user.role not in ("HR", "ADMIN"):
+        query = query.filter(Resignation.employee_id == get_employee_for_user(user, db).id)
+    return [resignation_output(db, item) for item in query.order_by(Resignation.created_at.desc()).limit(1000).all()]
+
+
+@api.patch("/resignations/{resignation_id}/decision")
+def decide_resignation(resignation_id: int, payload: ResignationDecision, user: User = Depends(require_roles("HR", "ADMIN")), db: Session = Depends(get_db)):
+    item = db.get(Resignation, resignation_id)
+    if not item:
+        raise HTTPException(404, "Resignation not found")
+    if item.status != "PENDING":
+        raise HTTPException(409, "This resignation has already been reviewed")
+    item.status = payload.status
+    item.reviewed_by = user.id
+    employee = get_employee(db, item.employee_id)
+    notify(db, employee.user_id, f"Resignation {payload.status.lower()}", f"Your resignation request was {payload.status.lower()}.")
+    db.commit()
+    db.refresh(item)
+    return resignation_output(db, item)
+
+
+# ANNOUNCEMENTS
+def announcement_output(db: Session, item: Announcement) -> dict:
+    creator = db.get(User, item.created_by)
+    return {"id": item.id, "title": item.title, "message": item.message,
+            "created_by": item.created_by, "created_by_name": creator.username if creator else "Unknown",
+            "created_at": item.created_at}
+
+
+@api.get("/announcements")
+def list_announcements(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    rows = db.query(Announcement).order_by(Announcement.created_at.desc()).limit(500).all()
+    return [announcement_output(db, item) for item in rows]
+
+
+@api.get("/announcements/{announcement_id}")
+def get_announcement(announcement_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    item = db.get(Announcement, announcement_id)
+    if not item:
+        raise HTTPException(404, "Announcement not found")
+    return announcement_output(db, item)
+
+
+@api.post("/announcements", status_code=201)
+def create_announcement(payload: AnnouncementCreate, user: User = Depends(require_roles("HR", "ADMIN")), db: Session = Depends(get_db)):
+    item = Announcement(created_by=user.id, **payload.model_dump())
+    db.add(item)
+    db.flush()
+    for recipient in db.query(User).filter(User.is_active.is_(True), User.id != user.id).all():
+        preferences = db.query(UserSettings).filter_by(user_id=recipient.id).first()
+        if not preferences or preferences.announcement_notifications:
+            notify(db, recipient.id, f"Announcement: {item.title}", item.message)
+    db.commit()
+    db.refresh(item)
+    return announcement_output(db, item)
+
+
+# INTERNAL TASKS
+def task_output(db: Session, item: InternalTask) -> dict:
+    employee = db.get(Employee, item.assigned_to)
+    return {"id": item.id, "assigned_to": item.assigned_to,
+            "employee_name": employee.full_name if employee else "Unknown",
+            "title": item.title, "description": item.description, "due_date": item.due_date,
+            "status": item.status, "assigned_by": item.assigned_by}
+
+
+@api.get("/tasks")
+def list_internal_tasks(employee_id: int | None = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    query = db.query(InternalTask)
+    if user.role not in ("HR", "ADMIN"):
+        query = query.filter(InternalTask.assigned_to == get_employee_for_user(user, db).id)
+    elif employee_id:
+        query = query.filter(InternalTask.assigned_to == employee_id)
+    return [task_output(db, item) for item in query.order_by(InternalTask.due_date, InternalTask.id).all()]
+
+
+@api.post("/tasks", status_code=201)
+def create_internal_task(payload: InternalTaskCreate, user: User = Depends(require_roles("HR", "ADMIN")), db: Session = Depends(get_db)):
+    employee = get_employee(db, payload.assigned_to)
+    item = InternalTask(assigned_by=user.id, **payload.model_dump())
+    db.add(item)
+    db.flush()
+    notify(db, employee.user_id, "New task assigned", f"{item.title} is due {item.due_date}.", "task_reminders")
+    db.commit()
+    db.refresh(item)
+    return task_output(db, item)
+
+
+@api.patch("/tasks/{task_id}")
+def update_internal_task(task_id: int, payload: InternalTaskUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    item = db.get(InternalTask, task_id)
+    if not item:
+        raise HTTPException(404, "Task not found")
+    if user.role not in ("HR", "ADMIN") and item.assigned_to != get_employee_for_user(user, db).id:
+        raise HTTPException(403, "You can only update your own tasks")
+    item.status = payload.status
+    db.commit()
+    db.refresh(item)
+    return task_output(db, item)
+
+
+# EMPLOYEE FEEDBACK
+@api.post("/feedback", status_code=201)
+def submit_feedback(payload: FeedbackCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    employee = get_employee_for_user(user, db)
+    item = Feedback(employee_id=employee.id, **payload.model_dump())
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+@api.get("/feedback")
+def list_feedback(employee_id: int | None = None, user: User = Depends(require_roles("HR", "ADMIN")), db: Session = Depends(get_db)):
+    query = db.query(Feedback)
+    if employee_id:
+        query = query.filter(Feedback.employee_id == employee_id)
+    rows = query.order_by(Feedback.created_at.desc()).limit(1000).all()
+    return [{"id": item.id, "employee_id": item.employee_id,
+             "employee_name": (db.get(Employee, item.employee_id).full_name if db.get(Employee, item.employee_id) else "Unknown"),
+             "message": item.message, "rating": item.rating, "created_at": item.created_at} for item in rows]
+
+
+# PROFILE, PASSWORD AND PREFERENCES
+@api.post("/auth/change-password")
+def change_password(payload: PasswordChange, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not verify_password(payload.current_password, user.hashed_password):
+        raise HTTPException(400, "Current password is incorrect")
+    if verify_password(payload.new_password, user.hashed_password):
+        raise HTTPException(400, "New password must be different from the current password")
+    user.hashed_password = hash_password(payload.new_password)
+    db.commit()
+    return {"message": "Password changed successfully"}
+
+
+def settings_output(item: UserSettings | None, user_id: int) -> dict:
+    return {"user_id": user_id, "email_notifications": item.email_notifications if item else False,
+            "task_reminders": item.task_reminders if item else True,
+            "announcement_notifications": item.announcement_notifications if item else True}
+
+
+@api.get("/settings/me")
+def get_my_settings(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    item = db.query(UserSettings).filter_by(user_id=user.id).first()
+    return settings_output(item, user.id)
+
+
+@api.put("/settings/me")
+def update_my_settings(payload: UserSettingsUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    item = db.query(UserSettings).filter_by(user_id=user.id).first()
+    if item is None:
+        item = UserSettings(user_id=user.id, **payload.model_dump())
+        db.add(item)
+    else:
+        for key, value in payload.model_dump().items():
+            setattr(item, key, value)
+    db.commit()
+    db.refresh(item)
+    return settings_output(item, user.id)
+
+
+# EMAIL AND GOOGLE CALENDAR INTEGRATIONS
+@api.get("/integrations/status")
+def integrations_status(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    connection = db.query(GoogleCalendarConnection).filter_by(user_id=user.id).first()
+    callback = urlsplit(settings.google_calendar_redirect_uri)
+    return {
+        "email_configured": bool(settings.smtp_host and settings.email_from),
+        "google_calendar_configured": _google_configured(),
+        "google_calendar_connected": connection is not None,
+        "google_calendar_connected_at": connection.connected_at if connection else None,
+        "google_calendar_callback_origin": f"{callback.scheme}://{callback.netloc}",
+    }
+
+
+@api.post("/integrations/email/test")
+def send_test_email(user: User = Depends(get_current_user)):
+    try:
+        send_email(user.email, "WorkSphere HRMS email test", "Your email notification settings are working.")
+    except HTTPException:
+        raise
+    except (OSError, smtplib.SMTPException) as exc:
+        logger.exception("SMTP test failed for user_id=%s", user.id)
+        raise HTTPException(502, "Email delivery failed. Check SMTP settings and server logs.") from exc
+    return {"message": f"Test email sent to {user.email}"}
+
+
+@api.get("/integrations/google/authorize")
+def authorize_google_calendar(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not _google_configured():
+        raise HTTPException(503, "Google Calendar is not configured. Set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET in backend .env.")
+    db.query(GoogleOAuthState).filter(GoogleOAuthState.expires_at < utc_now()).delete()
+    state = uuid4().hex + uuid4().hex
+    db.add(GoogleOAuthState(
+        state=state,
+        user_id=user.id,
+        expires_at=utc_now() + timedelta(minutes=10),
+    ))
+    db.commit()
+    authorization_url = GOOGLE_AUTH_URL + "?" + urlencode({
+        "client_id": settings.google_oauth_client_id,
+        "redirect_uri": settings.google_calendar_redirect_uri,
+        "response_type": "code",
+        "scope": GOOGLE_CALENDAR_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+        "state": state,
+    })
+    return {"authorization_url": authorization_url}
+
+
+@api.get("/integrations/google/callback", response_class=HTMLResponse)
+def google_calendar_callback(state: str | None = None, code: str | None = None,
+                             error: str | None = None, db: Session = Depends(get_db)):
+    if not state:
+        raise HTTPException(400, "Missing Google OAuth state.")
+    oauth_state = db.get(GoogleOAuthState, state)
+    if not oauth_state:
+        raise HTTPException(400, "Google OAuth state is invalid or has already been used.")
+    expiry = oauth_state.expires_at
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    if expiry < utc_now():
+        db.delete(oauth_state)
+        db.commit()
+        raise HTTPException(400, "Google OAuth state expired. Start the connection again.")
+    user_id = oauth_state.user_id
+    db.delete(oauth_state)
+    db.commit()
+    if error:
+        return google_oauth_result_page("error", "Google Calendar authorization was not granted.")
+    if not code:
+        return google_oauth_result_page("error", "Google did not return an authorization code.")
+    if not _google_configured():
+        raise HTTPException(503, "Google Calendar is not configured on this server.")
+    try:
+        token_request = Request(
+            GOOGLE_TOKEN_URL,
+            data=urlencode({
+                "code": code,
+                "client_id": settings.google_oauth_client_id or "",
+                "client_secret": settings.google_oauth_client_secret or "",
+                "redirect_uri": settings.google_calendar_redirect_uri,
+                "grant_type": "authorization_code",
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urlopen(token_request, timeout=20) as response:
+            token_result = json.loads(response.read())
+    except HTTPError as exc:
+        logger.warning("Google OAuth code exchange failed with status %s", exc.code)
+        raise HTTPException(502, "Google authorization could not be completed. Check OAuth settings and try again.") from exc
+    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        logger.warning("Google OAuth code exchange could not be completed: %s", type(exc).__name__)
+        raise HTTPException(502, "Could not reach Google authentication. Try again later.") from exc
+    if not isinstance(token_result, dict):
+        raise HTTPException(502, "Google returned an invalid authorization response.")
+    refresh_token = token_result.get("refresh_token")
+    if refresh_token is not None and (not isinstance(refresh_token, str) or not refresh_token):
+        raise HTTPException(502, "Google returned an invalid refresh token.")
+    connection = db.query(GoogleCalendarConnection).filter_by(user_id=user_id).first()
+    if not refresh_token and not connection:
+        raise HTTPException(400, "Google did not provide offline access. Remove this app from your Google Account permissions and connect again.")
+    if connection is None:
+        connection = GoogleCalendarConnection(
+            user_id=user_id,
+            encrypted_refresh_token=_google_token_cipher().encrypt(refresh_token.encode("utf-8")).decode("ascii"),
+        )
+        db.add(connection)
+    elif refresh_token:
+        connection.encrypted_refresh_token = _google_token_cipher().encrypt(refresh_token.encode("utf-8")).decode("ascii")
+    connection.connected_at = utc_now()
+    db.commit()
+    return google_oauth_result_page("connected", "Google Calendar connected. You can close this window.")
+
+
+@api.get("/integrations/google/status")
+def google_calendar_status(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    connection = db.query(GoogleCalendarConnection).filter_by(user_id=user.id).first()
+    return {"configured": _google_configured(), "connected": connection is not None,
+            "connected_at": connection.connected_at if connection else None}
+
+
+@api.delete("/integrations/google")
+def disconnect_google_calendar(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    connection = db.query(GoogleCalendarConnection).filter_by(user_id=user.id).first()
+    if connection:
+        try:
+            refresh_token = _google_token_cipher().decrypt(
+                connection.encrypted_refresh_token.encode("ascii")
+            ).decode("utf-8")
+        except (InvalidToken, UnicodeDecodeError) as exc:
+            logger.exception("Stored Google refresh token could not be decrypted for user_id=%s", user.id)
+            raise HTTPException(500, "Stored Google Calendar credentials cannot be read. Contact an administrator.") from exc
+        try:
+            revoke_request = Request(
+                "https://oauth2.googleapis.com/revoke",
+                data=urlencode({"token": refresh_token}).encode("utf-8"),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            with urlopen(revoke_request, timeout=20):
+                pass
+        except HTTPError as exc:
+            if exc.code != 400:
+                logger.warning("Google token revocation failed with status %s", exc.code)
+                raise HTTPException(502, "Google authorization could not be revoked. Try again later.") from exc
+        except (URLError, TimeoutError) as exc:
+            logger.warning("Google token revocation could not be completed: %s", type(exc).__name__)
+            raise HTTPException(502, "Could not reach Google to revoke calendar authorization.") from exc
+        db.query(GoogleCalendarEvent).filter_by(user_id=user.id).delete()
+        db.delete(connection)
+        db.commit()
+    return {"message": "Google Calendar disconnected"}
+
+
+@api.post("/integrations/google/sync")
+def sync_google_calendar(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not _google_configured():
+        raise HTTPException(503, "Google Calendar is not configured on this server.")
+    connection = db.query(GoogleCalendarConnection).filter_by(user_id=user.id).first()
+    if not connection:
+        raise HTTPException(409, "Connect a Google Calendar account before syncing.")
+    employee = get_employee_for_user(user, db)
+    access_token = _google_access_token(connection)
+    onboarding = db.query(OnboardingTask).filter_by(employee_id=employee.id).all()
+    tasks = db.query(InternalTask).filter_by(assigned_to=employee.id).all()
+    records = [
+        (kind, item.id, item.task_name if kind == "onboarding" else item.title,
+         item.due_date, item.status,
+         "" if kind == "onboarding" else item.description)
+        for kind, collection in (("onboarding", onboarding), ("task", tasks))
+        for item in collection
+    ]
+    counts = {"created": 0, "updated": 0, "removed": 0}
+    for kind, source_id, title, due_date, task_status, description in records:
+        mapping = db.query(GoogleCalendarEvent).filter_by(
+            user_id=user.id, source_type=kind, source_id=source_id,
+        ).first()
+        if task_status == "COMPLETED":
+            if mapping:
+                _google_json_request(
+                    f"{GOOGLE_CALENDAR_API}/{quote(mapping.google_event_id, safe='')}",
+                    method="DELETE", token=access_token,
+                )
+                db.delete(mapping)
+                counts["removed"] += 1
+            continue
+        event = {
+            "summary": title,
+            "description": description,
+            "start": {"date": due_date.isoformat()},
+            "end": {"date": (due_date + timedelta(days=1)).isoformat()},
+        }
+        stale_mapping = None
+        if mapping:
+            url = f"{GOOGLE_CALENDAR_API}/{quote(mapping.google_event_id, safe='')}"
+            result = _google_json_request(url, method="PATCH", token=access_token, payload=event)
+            if result.get("_http_status") == 404:
+                stale_mapping = mapping
+                mapping = None
+            else:
+                counts["updated"] += 1
+        if not mapping:
+            result = _google_json_request(GOOGLE_CALENDAR_API, method="POST", token=access_token, payload=event)
+            event_id = result.get("id")
+            if not isinstance(event_id, str) or not event_id:
+                raise HTTPException(502, "Google Calendar returned an invalid event response.")
+            if mapping:
+                mapping.google_event_id = event_id
+            elif stale_mapping:
+                stale_mapping.google_event_id = event_id
+            else:
+                db.add(GoogleCalendarEvent(
+                    user_id=user.id, source_type=kind, source_id=source_id, google_event_id=event_id,
+                ))
+            counts["created"] += 1
+    db.commit()
+    return {"message": "Google Calendar sync complete", **counts}
+
+
+# REPORT EXPORTS
+@api.get("/exports/reports.csv")
+def export_report(report_type: str = Query(pattern="^(employees|attendance|leaves|payroll|onboarding|resignations|tasks|feedback|announcements)$"),
+                  start_date: date | None = None, end_date: date | None = None,
+                  user: User = Depends(require_roles("HR", "ADMIN")), db: Session = Depends(get_db)):
+    if start_date and end_date and end_date < start_date:
+        raise HTTPException(400, "end_date must be on or after start_date")
+    if report_type == "employees":
+        rows = [employee_output(item) for item in db.query(Employee).order_by(Employee.id).all()]
+    elif report_type == "attendance":
+        query = db.query(Attendance)
+        if start_date: query = query.filter(Attendance.date >= start_date)
+        if end_date: query = query.filter(Attendance.date <= end_date)
+        rows = [attendance_output(item, get_employee(db, item.employee_id).full_name) for item in query.order_by(Attendance.date).all()]
+    elif report_type == "leaves":
+        query = db.query(Leave)
+        if start_date: query = query.filter(Leave.end_date >= start_date)
+        if end_date: query = query.filter(Leave.start_date <= end_date)
+        rows = [leave_output(db, item) for item in query.order_by(Leave.created_at).all()]
+    elif report_type == "payroll":
+        rows = [payroll_output(db, item) for item in db.query(Payroll).order_by(Payroll.month, Payroll.employee_id).all()]
+    elif report_type == "onboarding":
+        query = db.query(OnboardingTask)
+        if start_date: query = query.filter(OnboardingTask.due_date >= start_date)
+        if end_date: query = query.filter(OnboardingTask.due_date <= end_date)
+        rows = [onboarding_output(db, item) for item in query.order_by(OnboardingTask.due_date).all()]
+    elif report_type == "resignations":
+        rows = [resignation_output(db, item) for item in db.query(Resignation).order_by(Resignation.created_at).all()]
+    elif report_type == "tasks":
+        rows = [task_output(db, item) for item in db.query(InternalTask).order_by(InternalTask.due_date).all()]
+    elif report_type == "feedback":
+        rows = [{"id": item.id, "employee_id": item.employee_id, "message": item.message, "rating": item.rating,
+                 "created_at": item.created_at} for item in db.query(Feedback).order_by(Feedback.created_at).all()]
+    else:
+        rows = [announcement_output(db, item) for item in db.query(Announcement).order_by(Announcement.created_at).all()]
+    output = io.StringIO(newline="")
+    columns = list(rows[0].keys()) if rows else ["message"]
+    writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    if rows:
+        def safe_csv_value(value: object) -> object:
+            if isinstance(value, str) and value.lstrip(" \t\r\n").startswith(("=", "+", "-", "@")):
+                return f"'{value}"
+            return value
+        writer.writerows({key: safe_csv_value(value) for key, value in row.items()} for row in rows)
+    else:
+        writer.writerow({"message": f"No {report_type} records found"})
+    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv",
+                             headers={"Content-Disposition": f'attachment; filename="{report_type}-report.csv"'})

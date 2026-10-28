@@ -1,0 +1,43 @@
+.ws-module-loading{padding:24px;color:#778398;font-size:12px}
+.ws-module-heading{display:flex;align-items:center;justify-content:space-between;gap:16px}
+.ws-module-heading h2,.ws-panel>h2{margin:0;color:#26334a;font:800 16px Manrope,sans-serif}
+.ws-module-heading strong{color:#596bd1;font:800 16px Manrope,sans-serif}
+.ws-module-subtitle,.ws-panel>p,.ws-preferences>p{margin:8px 0 0;color:#8792a6;font-size:11px}
+.ws-progress{height:9px;margin-top:18px;border-radius:20px;background:#eef0f7;overflow:hidden}
+.ws-progress span{display:block;height:100%;border-radius:20px;background:linear-gradient(90deg,#6374d5,#8b9af1);transition:width .2s}
+.ws-employee-progress{display:grid;grid-template-columns:minmax(150px,1fr) minmax(120px,2fr);align-items:center;gap:14px;margin-top:14px}
+.ws-employee-progress b{display:block;color:#344058;font-size:10px}
+.ws-employee-progress small{display:block;margin-top:3px;color:#8994a8;font-size:9px}
+.ws-employee-progress .ws-progress{margin-top:0}
+.ws-module-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));align-items:end;gap:14px}
+.ws-module-form h2,.ws-module-form h3{grid-column:1/-1;margin:0;color:#26334a;font:800 15px Manrope,sans-serif}
+.ws-module-form>p{grid-column:1/-1}
+.ws-module-form>label{display:flex;flex-direction:column;gap:6px;color:#717d92;font-size:10px;font-weight:700}
+.ws-module-form input,.ws-module-form select,.ws-module-form textarea{width:100%;min-height:38px;border:1px solid #e1e6ef;border-radius:8px;padding:9px 10px;background:#fff;color:#354056;font-size:11px}
+.ws-module-form textarea{resize:vertical}
+.ws-module-form>button,.ws-module-form>.ws-module-actions{justify-self:start}
+.ws-module-list{display:flex;flex-direction:column;gap:10px}
+.ws-module-item{display:flex;align-items:center;gap:14px;padding:15px 17px;background:#fff;border:1px solid #e7ebf3;border-radius:12px}
+.ws-module-item>div:first-child{min-width:0;flex:1}
+.ws-module-item b{display:block;color:#344058;font-size:12px}
+.ws-module-item small{display:block;margin-top:5px;color:#8994a8;font-size:10px;line-height:1.55;overflow-wrap:anywhere}
+.ws-module-status{flex:none;padding:6px 9px;border-radius:20px;background:#edf0ff;color:#596bd1;font-size:9px;font-weight:800}
+.ws-module-status.completed,.ws-module-status.approved{background:#e7f8f1;color:#248d69}
+.ws-module-status.rejected{background:#fff0f0;color:#b74350}
+.ws-module-empty{padding:22px;text-align:center;color:#8b96aa;font-size:11px;background:#fff;border:1px solid #e7ebf3;border-radius:12px}
+.ws-module-actions{display:flex;gap:8px;flex-wrap:wrap}
+.ws-integration-card{display:flex;align-items:center;justify-content:space-between;gap:18px}
+.ws-integration-card h3{margin:0;color:#26334a;font:800 14px Manrope,sans-serif}
+.ws-integration-card p{max-width:620px;margin:6px 0 0;color:#8792a6;font-size:11px;line-height:1.55}
+.ws-integration-card button:disabled{opacity:.55;cursor:not-allowed}
+.ws-announcement{display:block}
+.ws-announcement-title{padding:0;border:0;background:transparent;color:#344058;font-size:13px;font-weight:800;text-align:left}
+.ws-announcement-title:hover{color:#596bd1}
+.ws-announcement-detail{margin:12px 0 0;padding-top:12px;border-top:1px solid #edf0f5;color:#59657a;font-size:12px;line-height:1.6;white-space:pre-wrap}
+.ws-preferences{display:flex;flex-direction:column;align-items:flex-start;gap:13px}
+.ws-preferences h3{margin:0;color:#26334a;font:800 15px Manrope,sans-serif}
+.ws-preferences>label{display:flex;align-items:center;gap:9px;color:#59657a;font-size:11px}
+.ws-preferences input{accent-color:#6878dc}
+.ws-module-item .ws-module-actions{flex:none}
+@media(max-width:700px){.ws-module-item{align-items:flex-start;flex-wrap:wrap}.ws-module-item>div:first-child{flex-basis:calc(100% - 110px)}.ws-module-heading{align-items:flex-start;flex-direction:column}.ws-integration-card{align-items:flex-start;flex-direction:column}}
+@media print{.ws-sidebar,.ws-topbar,.ws-alert,.ws-footer,.ws-module-form button{display:none!important}.ws-main{padding:0}.ws-module-list,.ws-panel{break-inside:avoid}.ws-shell{display:block}}

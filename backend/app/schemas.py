@@ -120,3 +120,54 @@ class PayrollOut(BaseModel):
 class NotificationOut(BaseModel):
     id: int; user_id: int; title: str; message: str; is_read: bool; created_at: datetime
     model_config = ConfigDict(from_attributes=True)
+
+class OnboardingTaskCreate(BaseModel):
+    employee_id: int = Field(gt=0)
+    task_name: str = Field(min_length=1, max_length=200)
+    due_date: date
+
+class OnboardingTaskUpdate(BaseModel):
+    status: str = Field(pattern="^(PENDING|COMPLETED)$")
+
+class ResignationCreate(BaseModel):
+    reason: str = Field(min_length=1, max_length=5000)
+    notice_period: int = Field(ge=0, le=365)
+
+class ResignationDecision(BaseModel):
+    status: str = Field(pattern="^(APPROVED|REJECTED)$")
+
+class AnnouncementCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    message: str = Field(min_length=1, max_length=10000)
+
+class InternalTaskCreate(BaseModel):
+    assigned_to: int = Field(gt=0)
+    title: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=5000)
+    due_date: date
+
+class InternalTaskUpdate(BaseModel):
+    status: str = Field(pattern="^(PENDING|COMPLETED)$")
+
+class FeedbackCreate(BaseModel):
+    message: str = Field(min_length=1, max_length=5000)
+    rating: int = Field(ge=1, le=5)
+
+class ProfileUpdate(BaseModel):
+    full_name: str = Field(min_length=1, max_length=160)
+    email: str = Field(min_length=5, max_length=255)
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v: str) -> str:
+        v = v.strip().lower()
+        if "@" not in v or "." not in v.rsplit("@", 1)[-1]: raise ValueError("Enter a valid email address")
+        return v
+
+class PasswordChange(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=10, max_length=128)
+
+class UserSettingsUpdate(BaseModel):
+    email_notifications: bool
+    task_reminders: bool
+    announcement_notifications: bool

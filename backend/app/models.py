@@ -132,3 +132,77 @@ class PerformanceReview(Base):
     rating: Mapped[float] = mapped_column(Float)
     feedback: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+class OnboardingTask(Base):
+    __tablename__ = "onboarding"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), index=True)
+    task_name: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(20), default="PENDING", index=True)
+    due_date: Mapped[date] = mapped_column(Date, index=True)
+
+class Resignation(Base):
+    __tablename__ = "resignations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    notice_period: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+class Announcement(Base):
+    __tablename__ = "announcements"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    message: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+class InternalTask(Base):
+    __tablename__ = "tasks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    assigned_to: Mapped[int] = mapped_column(ForeignKey("employees.id"), index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(Text, default="")
+    due_date: Mapped[date] = mapped_column(Date, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING", index=True)
+    assigned_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+
+class Feedback(Base):
+    __tablename__ = "feedback"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), index=True)
+    message: Mapped[str] = mapped_column(Text)
+    rating: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+class UserSettings(Base):
+    __tablename__ = "user_settings"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
+    email_notifications: Mapped[bool] = mapped_column(Boolean, default=False)
+    task_reminders: Mapped[bool] = mapped_column(Boolean, default=True)
+    announcement_notifications: Mapped[bool] = mapped_column(Boolean, default=True)
+
+class GoogleCalendarConnection(Base):
+    __tablename__ = "google_calendar_connections"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
+    encrypted_refresh_token: Mapped[str] = mapped_column(Text)
+    connected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+class GoogleOAuthState(Base):
+    __tablename__ = "google_oauth_states"
+    state: Mapped[str] = mapped_column(String(128), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+class GoogleCalendarEvent(Base):
+    __tablename__ = "google_calendar_events"
+    __table_args__ = (UniqueConstraint("user_id", "source_type", "source_id", name="uq_calendar_source_per_user"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    source_type: Mapped[str] = mapped_column(String(20))
+    source_id: Mapped[int] = mapped_column(Integer)
+    google_event_id: Mapped[str] = mapped_column(String(255))
