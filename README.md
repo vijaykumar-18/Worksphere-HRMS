@@ -219,7 +219,7 @@ All API routes are under `/api`:
 - HR/Admin users can assign onboarding and internal tasks, review resignations, publish announcements, inspect employee feedback and export reports.
 - Email is disabled unless SMTP is configured and an employee enables email notifications. Task reminders and announcement notifications can be managed separately under **Profile & settings**.
 - Google Calendar sync requires OAuth credentials and user authorization; only onboarding and assigned-task events belonging to the connected employee are synchronized.
-- PDF reports use the browser print dialog; select **Save as PDF** in the print destination.
+- PDF reports use the browser print dialog; select *Save as PDF* in the print destination.
 
 ## Before production
 
