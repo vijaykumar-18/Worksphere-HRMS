@@ -92,4 +92,4 @@ app.include_router(api, prefix="/api")
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "application": "WorkSphere HRMS"}
+    return {"status": "ok", "application running": "WorkSphere HRMS"}

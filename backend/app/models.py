@@ -206,3 +206,4 @@ class GoogleCalendarEvent(Base):
     source_type: Mapped[str] = mapped_column(String(20))
     source_id: Mapped[int] = mapped_column(Integer)
     google_event_id: Mapped[str] = mapped_column(String(255))
+#end
